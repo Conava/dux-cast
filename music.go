@@ -221,13 +221,13 @@ func playlistEntryFor(ref, dir, title string) playlistEntry {
 
 // expandPlaylist answers {"cmd":"playlist"} with the entries, or an empty
 // list when the file can't be read.
-func (h *helper) expandPlaylist(file string) {
+func (h *helper) expandPlaylist(file string, to *client) {
 	entries, err := readPlaylist(file)
 	if err != nil {
-		h.emitError("unsupportedFile", err)
+		to.send(errorEvent("unsupportedFile", err))
 	}
 	if entries == nil {
 		entries = []playlistEntry{}
 	}
-	h.emit(map[string]any{"event": "playlist", "path": file, "items": entries})
+	to.send(map[string]any{"event": "playlist", "path": file, "items": entries})
 }

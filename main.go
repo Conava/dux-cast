@@ -1,6 +1,10 @@
-// Command cast-helper does the casting for the Cast plugin. It
-// reads one JSON command per line on stdin and writes one JSON event per line
-// on stdout, and exits when stdin closes.
+// Command cast-helper casts the screen and media to Chromecast and AirPlay
+// devices. Clients send one JSON command per line and get one JSON event per
+// line; PROTOCOL.md lists them.
+//
+//	cast-helper          talks over stdin and stdout, exits when stdin closes
+//	cast-helper serve    the shared helper, on a socket in $XDG_RUNTIME_DIR
+//	cast-helper attach   connects stdin and stdout to it, starting it if needed
 package main
 
 import (
@@ -9,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -46,14 +51,23 @@ type command struct {
 	Pin      string  `json:"pin"`  // AirPlay pairing PIN or password
 	Position float64 `json:"position"`
 	Size     int     `json:"size"` // thumbnail width
-	// queue
-	Items         []struct{ Path, URL string } `json:"items"`
-	Index         int                          `json:"index"`
-	Interval      int                          `json:"interval"`
-	Loop          bool                         `json:"loop"`
-	ShrinkPhotos  *bool                        `json:"shrinkPhotos"`
-	ConvertVideos *bool                        `json:"convertVideos"`
+	// hello
+	Client string `json:"client"`
+	Name   string `json:"name"`
+	// play, and each queue item
+	queueSource
+	Items         []commandItem `json:"items"`
+	Index         int           `json:"index"`
+	Interval      int           `json:"interval"`
+	Loop          bool          `json:"loop"`
+	ShrinkPhotos  *bool         `json:"shrinkPhotos"`
+	ConvertVideos *bool         `json:"convertVideos"`
 	castOptions
+}
+
+type commandItem struct {
+	Path, URL string
+	queueSource
 }
 
 // source is the path or link of a play command or queue item.
@@ -104,74 +118,124 @@ func (p *pendingSession) Stop() {
 	}
 	p.h.mu.Unlock()
 	p.h.emitState()
+	p.h.checkIdle()
 }
 
 type helper struct {
-	outMu sync.Mutex
-	out   *json.Encoder
+	cmu     sync.Mutex
+	clients map[*client]bool
+	serving bool          // cast-helper serve: quits when idle
+	idle    chan struct{} // nothing connected and nothing casting
 
 	mu           sync.Mutex
 	devices      map[string]device
 	stopDiscover context.CancelFunc
 	discoverers  int // the plugin's request plus a start waiting for its device
 	sess         activeSession
+	owner        owner // the client that started sess
 	// The portal's restore tokens are single use: the newest one is kept for
 	// moving a cast, which opens a new portal session.
 	restoreToken string
 }
 
+// owner names the client that started a session, so every client can say
+// where it plays from.
+type owner struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func newHelper() *helper {
+	return &helper{clients: map[*client]bool{}, devices: map[string]device{}, idle: make(chan struct{}, 1)}
+}
+
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	log.SetPrefix("")
-	h := &helper{out: json.NewEncoder(os.Stdout), devices: map[string]device{}}
-	removeStaleRemuxes()
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	lines := make(chan string)
-	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		sc.Buffer(make([]byte, 64<<10), 1<<20)
-		for sc.Scan() {
-			lines <- sc.Text()
-		}
-		close(lines)
-	}()
-
-	for {
-		select {
-		case <-sig:
-			h.shutdown()
-			return
-		case line, ok := <-lines:
-			if !ok {
-				h.shutdown()
-				return
-			}
-			var c command
-			if err := json.Unmarshal([]byte(line), &c); err != nil {
-				log.Printf("bad command %q: %v", line, err)
-				continue
-			}
-			h.handle(c)
-		}
+	var err error
+	switch mode := strings.Join(os.Args[1:], " "); mode {
+	case "":
+		err = runStdio()
+	case "serve":
+		err = runServe()
+	case "attach":
+		err = runAttach()
+	case "version", "--version":
+		fmt.Println(version)
+	default:
+		err = fmt.Errorf("unknown command %q; use serve, attach or no argument", mode)
+	}
+	if err != nil {
+		log.Print(err)
+		os.Exit(1)
 	}
 }
 
-// protocolVersion goes up when a command or event changes incompatibly; the
-// plugin asks for an update when its own number differs.
-const protocolVersion = 1
+// runStdio serves one client on stdin and stdout and stops its cast when
+// stdin closes.
+func runStdio() error {
+	h := newHelper()
+	removeStaleRemuxes()
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	done := make(chan struct{})
+	go func() {
+		h.serveClient(newClient(os.Stdout, nil), os.Stdin)
+		close(done)
+	}()
+	select {
+	case <-sig:
+	case <-done:
+	}
+	h.shutdown()
+	return nil
+}
 
-func (h *helper) handle(c command) {
+// serveClient reads one client's commands until it disconnects.
+func (h *helper) serveClient(c *client, r io.Reader) {
+	h.cmu.Lock()
+	h.clients[c] = true
+	h.cmu.Unlock()
+	c.send(h.stateEvent())
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64<<10), 1<<20)
+	for sc.Scan() {
+		var cmd command
+		if err := json.Unmarshal(sc.Bytes(), &cmd); err != nil {
+			log.Printf("bad command %q: %v", sc.Text(), err)
+			continue
+		}
+		h.handle(cmd, c)
+	}
+	h.cmu.Lock()
+	delete(h.clients, c)
+	h.cmu.Unlock()
+	h.setDiscovery(c, false)
+	c.close()
+	h.checkIdle()
+}
+
+// version is this release; the release workflow checks the tag against it.
+const version = "0.1.0"
+
+// protocolVersion goes up when commands or events are added. Changes are
+// additive, so a client needs a helper with at least its own number.
+const protocolVersion = 2
+
+func (h *helper) handle(c command, from *client) {
 	switch c.Cmd {
+	case "hello":
+		from.owner = owner{ID: c.Client, Name: c.Name}
 	case "check":
-		h.emit(dependencyReport())
+		report := dependencyReport()
+		report["version"] = version
+		from.send(report)
 	case "discover":
-		h.setDiscovery(c.On)
+		h.setDiscovery(from, c.On)
 	case "start":
 		// Chromecast unless the device only speaks AirPlay, or the user chose
 		// AirPlay for mirroring it.
-		h.start(c.Device, func(d device) activeSession {
+		h.start(c.Device, from, func(d device) activeSession {
 			if d.has("airplay") && (c.Protocol == "airplay" || !d.has("chromecast")) {
 				return newAirplaySession(h, d, c.castOptions)
 			}
@@ -187,41 +251,44 @@ func (h *helper) handle(c command) {
 	case "play":
 		src, err := source(c.Path, c.URL)
 		if err != nil {
-			h.emitError("unsupportedLink", err)
+			from.send(errorEvent("unsupportedLink", err))
 			return
 		}
 		opts := queueOptions{ShrinkPhotos: c.ShrinkPhotos != nil && *c.ShrinkPhotos, ConvertVideos: orTrue(c.ConvertVideos), Port: c.Port}
-		h.start(c.Device, func(d device) activeSession { return newMediaSession(h, d, []string{src}, 0, opts) })
+		item := c.queueSource
+		item.Source = src
+		h.start(c.Device, from, func(d device) activeSession { return newMediaSession(h, d, []queueSource{item}, 0, opts) })
 	case "playlist":
-		go h.expandPlaylist(c.Path)
+		go h.expandPlaylist(c.Path, from)
 	case "queue":
-		var srcs []string
-		add := func(path, link string) {
+		var srcs []queueSource
+		add := func(path, link string, meta queueSource) {
 			if src, err := source(path, link); err == nil {
-				srcs = append(srcs, src)
+				meta.Source = src
+				srcs = append(srcs, meta)
 			}
 		}
 		for _, it := range c.Items {
 			if it.URL == "" && isPlaylist(it.Path) {
 				entries, _ := readPlaylist(it.Path)
 				for _, e := range entries {
-					add(e.Path, e.URL)
+					add(e.Path, e.URL, queueSource{Title: e.Title})
 				}
 				continue
 			}
-			add(it.Path, it.URL)
+			add(it.Path, it.URL, it.queueSource)
 		}
 		if len(srcs) == 0 {
-			h.emitError("unsupportedLink", errors.New("empty queue"))
+			from.send(errorEvent("unsupportedLink", errors.New("empty queue")))
 			return
 		}
 		opts := queueOptions{Interval: c.Interval, Loop: c.Loop, ShrinkPhotos: c.ShrinkPhotos != nil && *c.ShrinkPhotos,
 			ConvertVideos: orTrue(c.ConvertVideos), Port: c.Port}
-		h.start(c.Device, func(d device) activeSession { return newMediaSession(h, d, srcs, c.Index, opts) })
+		h.start(c.Device, from, func(d device) activeSession { return newMediaSession(h, d, srcs, c.Index, opts) })
 	case "move":
 		go h.move(c.Device)
 	case "thumbnail":
-		go h.thumbnail(c.Path, c.Size)
+		go h.thumbnail(c.Path, c.Size, from)
 	case "pause", "resume", "seek", "subtitles", "next", "previous", "jump", "slideshow":
 		h.mu.Lock()
 		m, _ := h.sess.(*mediaSession)
@@ -248,15 +315,22 @@ func (h *helper) handle(c command) {
 	}
 }
 
+// emit sends an event to every client.
 func (h *helper) emit(v any) {
-	h.outMu.Lock()
-	defer h.outMu.Unlock()
-	if err := h.out.Encode(v); err != nil {
-		log.Printf("stdout: %v", err)
+	h.cmu.Lock()
+	clients := make([]*client, 0, len(h.clients))
+	for c := range h.clients {
+		clients = append(clients, c)
+	}
+	h.cmu.Unlock()
+	for _, c := range clients {
+		c.send(v)
 	}
 }
 
-func (h *helper) emitError(code string, err error) {
+func (h *helper) emitError(code string, err error) { h.emit(errorEvent(code, err)) }
+
+func errorEvent(code string, err error) map[string]any {
 	log.Printf("error %s: %v", code, err)
 	msg := map[string]any{"event": "error", "code": code}
 	var m *missingError
@@ -266,7 +340,7 @@ func (h *helper) emitError(code string, err error) {
 	if err != nil {
 		msg["detail"] = err.Error()
 	}
-	h.emit(msg)
+	return msg
 }
 
 // missingError says which packages a feature needs; the plugin names them.
@@ -287,8 +361,10 @@ func need(feature string) error {
 	return nil
 }
 
-// emitState pushes the full state; the plugin keeps no state of its own.
-func (h *helper) emitState() {
+// emitState pushes the full state; clients keep no state of their own.
+func (h *helper) emitState() { h.emit(h.stateEvent()) }
+
+func (h *helper) stateEvent() map[string]any {
 	h.mu.Lock()
 	devs := make([]device, 0, len(h.devices))
 	for _, d := range h.devices {
@@ -296,16 +372,26 @@ func (h *helper) emitState() {
 	}
 	var sess any
 	if h.sess != nil {
-		sess = h.sess.status()
+		st := h.sess.status()
+		if h.owner.ID != "" {
+			st["owner"] = h.owner
+		}
+		sess = st
 	}
 	h.mu.Unlock()
 	slices.SortFunc(devs, func(a, b device) int { return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name)) })
-	h.emit(map[string]any{"event": "state", "devices": devs, "session": sess})
+	return map[string]any{"event": "state", "devices": devs, "session": sess}
 }
 
-// setDiscovery follows the plugin's request to browse while a device list is
-// on screen.
-func (h *helper) setDiscovery(on bool) {
+// setDiscovery browses while any client shows a device list.
+func (h *helper) setDiscovery(from *client, on bool) {
+	h.cmu.Lock()
+	from.discover = on
+	on = false
+	for c := range h.clients {
+		on = on || c.discover
+	}
+	h.cmu.Unlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if on == (h.discoverers&1 == 1) {
@@ -385,16 +471,23 @@ func (h *helper) lookup(id string) (device, bool) {
 	return device{}, false
 }
 
-func (h *helper) start(id string, create func(device) activeSession) {
+// start casts to a device for a client; a moved cast keeps its owner and has
+// no client.
+func (h *helper) start(id string, from *client, create func(device) activeSession) {
 	h.mu.Lock()
+	by := h.owner
+	if from != nil {
+		by = from.owner
+	}
 	if h.sess != nil {
+		busy := fmt.Errorf("already casting to %s", h.sess.deviceID())
 		h.mu.Unlock()
-		h.emitError("busy", fmt.Errorf("already casting to %s", h.sess.deviceID()))
+		from.send(errorEvent("busy", busy))
 		return
 	}
 	// Reserve the slot so a second start can't race this one.
 	placeholder := &pendingSession{h: h, id: id, since: time.Now()}
-	h.sess = placeholder
+	h.sess, h.owner = placeholder, by
 	h.mu.Unlock()
 	h.emitState()
 
@@ -433,6 +526,7 @@ func (h *helper) endSession(s activeSession, code string, err error) {
 		h.emitError(code, err)
 	}
 	h.emitState()
+	h.checkIdle()
 }
 
 // move ends what is casting and starts the same on another device: a
@@ -481,7 +575,7 @@ func (h *helper) move(id string) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	h.start(id, create)
+	h.start(id, nil, create)
 }
 
 func (h *helper) shutdown() {

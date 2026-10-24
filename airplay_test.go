@@ -37,7 +37,8 @@ func TestAirplayReceiver(t *testing.T) {
 	doubletakeTestArgs = []string{"-test"}
 	var events []string
 	out := writerFunc(func(p []byte) { events = append(events, strings.TrimSpace(string(p))) })
-	h := &helper{out: json.NewEncoder(out), devices: map[string]device{}}
+	h := newHelper()
+	h.clients[newClient(out, nil)] = true
 	var ap int
 	json.Unmarshal([]byte(port), &ap)
 	a := newAirplaySession(h, device{ID: "airplay:test", Name: "Test", Protocols: []string{"airplay"}, Host: "127.0.0.1", AirplayPort: ap},

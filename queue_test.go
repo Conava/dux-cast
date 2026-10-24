@@ -3,7 +3,7 @@ package main
 import "testing"
 
 func TestLookAhead(t *testing.T) {
-	m := newMediaSession(nil, device{}, []string{"/a.jpg", "/b.jpg", "/c.mp4", "/d.jpg", "/e.mp4"}, 0, queueOptions{})
+	m := newMediaSession(nil, device{}, []queueSource{{Source: "/a.jpg"}, {Source: "/b.jpg"}, {Source: "/c.mp4"}, {Source: "/d.jpg"}, {Source: "/e.mp4"}}, 0, queueOptions{})
 	order := func() (got []int) {
 		for i := m.nextToPrepare(); i >= 0; i = m.nextToPrepare() {
 			got = append(got, i)

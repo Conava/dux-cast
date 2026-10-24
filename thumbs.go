@@ -17,12 +17,12 @@ var thumbSlots = make(chan struct{}, 2)
 
 // thumbnail writes a JPEG of a video's first frame, cached by path, size and
 // modification time, and reports where it is.
-func (h *helper) thumbnail(file string, size int) {
+func (h *helper) thumbnail(file string, size int, to *client) {
 	if size <= 0 || size > 1024 {
 		size = 256
 	}
 	reply := func(out string) {
-		h.emit(map[string]any{"event": "thumbnail", "path": file, "file": out})
+		to.send(map[string]any{"event": "thumbnail", "path": file, "file": out})
 	}
 	st, err := os.Stat(file)
 	if !filepath.IsAbs(file) || err != nil {

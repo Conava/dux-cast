@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -68,10 +69,23 @@ type queueOptions struct {
 	StartAt       float64 // position in the first item, for a moved cast
 }
 
+// queueSource is one item as a client sends it. The metadata is optional; a
+// song file's own tags fill in what's missing.
+type queueSource struct {
+	Source string `json:"-"`
+	Title  string `json:"title,omitempty"`
+	Artist string `json:"artist,omitempty"`
+	Album  string `json:"album,omitempty"`
+	Art    string `json:"art,omitempty"` // http(s) link or absolute path of a cover
+}
+
 type queueItem struct {
 	source   string // absolute path or http(s) link
 	title    string
+	named    bool   // the title came from the client, not the file or link
 	artist   string // songs
+	album    string
+	art      string
 	kind     string // image, video, audio, link, youtube
 	status   string // waiting, preparing, ready, failed
 	progress float64
@@ -81,13 +95,18 @@ type queueItem struct {
 	code     string
 }
 
-func newQueueItem(source string) *queueItem {
-	it := &queueItem{source: source, title: filepath.Base(source), status: "waiting"}
+func newQueueItem(src queueSource) *queueItem {
+	source := src.Source
+	it := &queueItem{source: source, title: filepath.Base(source), status: "waiting",
+		artist: src.Artist, album: src.Album, art: src.Art}
 	if u, err := url.Parse(source); err == nil && u.Host != "" {
 		it.title = u.Host
 		if base := path.Base(u.Path); base != "/" && base != "." {
 			it.title = base
 		}
+	}
+	if src.Title != "" {
+		it.title, it.named = src.Title, true
 	}
 	ct := typeByExt(source)
 	switch {
@@ -106,7 +125,7 @@ func newQueueItem(source string) *queueItem {
 	return it
 }
 
-func newMediaSession(h *helper, d device, sources []string, index int, opts queueOptions) *mediaSession {
+func newMediaSession(h *helper, d device, sources []queueSource, index int, opts queueOptions) *mediaSession {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &mediaSession{h: h, dev: d, opts: opts, ctx: ctx, cancel: cancel, done: make(chan struct{}),
 		cmds: make(chan command, 8), ready: make(chan int, 8), phase: "starting", index: index}
@@ -126,7 +145,7 @@ func (m *mediaSession) status() map[string]any {
 	defer m.mu.Unlock()
 	cur := m.items[m.index]
 	title := cur.title
-	if m.st.Title != "" && (cur.kind == "youtube" || cur.kind == "link") {
+	if m.st.Title != "" && !cur.named && (cur.kind == "youtube" || cur.kind == "link") {
 		title = m.st.Title
 	}
 	at := int64(0)
@@ -135,7 +154,10 @@ func (m *mediaSession) status() map[string]any {
 	}
 	queue := make([]map[string]any, len(m.items))
 	for i, it := range m.items {
-		q := map[string]any{"title": it.title, "artist": it.artist, "kind": it.kind, "status": it.status, "progress": it.progress}
+		q := map[string]any{"title": it.title, "artist": it.artist, "album": it.album, "kind": it.kind, "status": it.status, "progress": it.progress}
+		if isLink(it.art) {
+			q["art"] = it.art
+		}
 		if it.status == "failed" {
 			q["error"] = it.code
 			var miss *missingError
@@ -167,12 +189,15 @@ func (m *mediaSession) position() (index int, at float64) {
 	return m.index, at
 }
 
-func (m *mediaSession) sources() []string {
+func (m *mediaSession) sources() []queueSource {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s := make([]string, len(m.items))
+	s := make([]queueSource, len(m.items))
 	for i, it := range m.items {
-		s[i] = it.source
+		s[i] = queueSource{Source: it.source, Artist: it.artist, Album: it.album, Art: it.art}
+		if it.named {
+			s[i].Title = it.title
+		}
 	}
 	return s
 }
@@ -270,7 +295,7 @@ func (m *mediaSession) run() (code string, err error) {
 		}
 		needsServer := false
 		for _, it := range m.items {
-			needsServer = needsServer || (it.kind != "link" && it.kind != "youtube")
+			needsServer = needsServer || (it.kind != "link" && it.kind != "youtube") || filepath.IsAbs(it.art)
 		}
 		if needsServer {
 			ip, err := sourceIP(m.dev.Host)
@@ -595,6 +620,20 @@ func (m *mediaSession) prepareAhead() {
 	}()
 }
 
+// artURL is where the device fetches an item's cover from the client: a link
+// as it is, a local file over the file server.
+func (m *mediaSession) artURL(i int, it *queueItem) string {
+	switch {
+	case isLink(it.art):
+		return it.art
+	case filepath.IsAbs(it.art) && m.srv != nil:
+		if _, err := os.Stat(it.art); err == nil {
+			return m.srv.add(fmt.Sprintf("%d-art%s", i, path.Ext(it.art)), it.art, typeByExt(it.art))
+		}
+	}
+	return ""
+}
+
 func (m *mediaSession) hasLinks() bool {
 	for _, it := range m.items {
 		if it.kind == "link" {
@@ -662,7 +701,8 @@ func (m *mediaSession) setItemProgress(it *queueItem) func(float64) {
 // any conversion the device needs.
 func (m *mediaSession) prepare(i int, it *queueItem) error {
 	if it.kind == "link" {
-		it.media = mediaInfo{url: it.source, contentType: remoteType(m.ctx, it.source), title: it.title}
+		it.media = mediaInfo{url: it.source, contentType: remoteType(m.ctx, it.source), title: it.title,
+			artist: it.artist, album: it.album, coverURL: m.artURL(i, it)}
 		return nil
 	}
 	if _, err := os.Stat(it.source); err != nil {
@@ -681,12 +721,15 @@ func (m *mediaSession) prepare(i int, it *queueItem) error {
 	it.media = mediaInfo{url: m.srv.add(fmt.Sprintf("%d%s", i, path.Ext(file)), file, ct), contentType: ct, title: it.title}
 	if it.kind == "audio" {
 		song := probeSong(it.source)
-		if song.title != "" {
+		if song.title != "" && !it.named {
 			it.title = song.title
 		}
-		it.artist = song.artist
-		it.media.title, it.media.artist, it.media.album = it.title, song.artist, song.album
+		it.artist = cmp.Or(it.artist, song.artist)
+		it.album = cmp.Or(it.album, song.album)
+		it.media.title, it.media.artist, it.media.album = it.title, it.artist, it.album
 		switch cover := folderCover(it.source); {
+		case it.art != "":
+			it.media.coverURL = m.artURL(i, it)
 		case song.cover != nil:
 			it.media.coverURL = m.srv.addBytes(fmt.Sprintf("%d-cover", i), song.cover, song.coverType)
 		case cover != "":
