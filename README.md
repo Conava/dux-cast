@@ -7,15 +7,15 @@ it sees and controls the same cast.
 
 - Screen mirroring with sound: Chromecast (real time, GPU encoded) or AirPlay through
   [doubletake](https://github.com/omarroth/doubletake).
-- Files, music, photos, playlists and links on Chromecast devices. What a device can't play is
-  converted on the GPU first.
-- Devices are found with Avahi. MPRIS shows what's playing.
+- Files, music, photos, playlists and links on Chromecast devices.
+- Incompatible files are converted on-demand with GPU acceleration.
+- Devices are found with Avahi. MPRIS is supported to control playing media.
 
 ## Install
 
-### 1. The packages
+### 1. Dependencies
 
-Arch users can skip this: the AUR package below pulls them in.
+Arch users may skip this step by using the AUR package listed below. Installing all optional dependencies is recommended.
 
 Debian / Ubuntu:
 
@@ -45,8 +45,10 @@ sudo pacman -S --needed avahi gstreamer gst-plugins-base gst-plugins-bad gst-plu
   gst-plugins-good gst-libav libheif
 ```
 
-The first line of each is required. The second is recommended: more formats, sound on the cast
-device only, HEIC photos. Then start Avahi:
+The first line each are the required dependencies, the second line is recommended for more formats, 
+sound on the cast device only, HEIC photos. 
+
+To start Avahi:
 
 ```bash
 sudo systemctl enable --now avahi-daemon
@@ -56,16 +58,15 @@ Mirroring needs VA-API H.264 or HEVC encoding. Fedora and openSUSE ship drivers 
 them from RPM Fusion or Packman. `{"cmd": "check"}` lists every package, what it's for and whether
 it's installed; the Cast plugin shows that list in its settings.
 
-### 2. cast-helper
+### 2. Install cast-helper
 
 Arch (AUR):
 
 ```bash
-yay -S cast-helper
+paru -S cast-helper
 ```
 
-Or download the release build (x86_64 or aarch64, built by GitHub Actions from the tagged source).
-It's only installed if it matches the release's checksums:
+Or download the release build (x86_64 or aarch64, built automatically on release):
 
 ```bash
 (mkdir -p ~/.local/share/dms/cast/bin && cd ~/.local/share/dms/cast/bin \
@@ -76,7 +77,7 @@ It's only installed if it matches the release's checksums:
   && mv cast-helper-$(uname -m) cast-helper && chmod +x cast-helper)
 ```
 
-Or build it (Go 1.25 or newer, no C compiler):
+Build from source (Go 1.25 or newer):
 
 ```bash
 git clone https://github.com/Conava/dux-cast.git && cd dux-cast
@@ -92,7 +93,7 @@ cast-helper is tested with 0.5.0 and finds it on `PATH`, in `~/.local/share/dms/
 Arch (AUR):
 
 ```bash
-yay -S doubletake-bin
+paru -S doubletake-bin
 ```
 
 Other distributions, from its releases (x86_64 shown, use `doubletake-arm64` on aarch64):
@@ -122,8 +123,7 @@ Commands and events are JSON lines, described in [PROTOCOL.md](PROTOCOL.md).
 
 Apart from the cast devices on the local network, the helper only contacts youtube.com, when a
 YouTube link is played, and the server of a direct link, to ask for its media type when the address
-doesn't show it. Files are served to the cast device only, from a port that only answers its
-address.
+doesn't show it. Files are served to the cast device only.
 
 | Path | Contents |
 |---|---|
