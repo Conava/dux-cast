@@ -9,6 +9,7 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -57,9 +58,12 @@ type command struct {
 	// play, and each queue item
 	queueSource
 	Items         []commandItem `json:"items"`
+	sources       []queueSource // edit: Items with playlists expanded
 	Index         int           `json:"index"`
 	Interval      int           `json:"interval"`
 	Loop          bool          `json:"loop"`
+	Repeat        string        `json:"repeat"` // queue and repeat: "show", "item" or ""
+	Times         int           `json:"times"`  // queue and repeat: 0 until stopped
 	ShrinkPhotos  *bool         `json:"shrinkPhotos"`
 	ConvertVideos *bool         `json:"convertVideos"`
 	castOptions
@@ -83,6 +87,28 @@ func source(path, link string) (string, error) {
 		return "", fmt.Errorf("not an absolute path: %q", path)
 	}
 	return path, nil
+}
+
+// queueSources checks a queue's items and expands the playlist files among them.
+func queueSources(items []commandItem) []queueSource {
+	var srcs []queueSource
+	add := func(path, link string, meta queueSource) {
+		if src, err := source(path, link); err == nil {
+			meta.Source = src
+			srcs = append(srcs, meta)
+		}
+	}
+	for _, it := range items {
+		if it.URL == "" && isPlaylist(it.Path) {
+			entries, _ := readPlaylist(it.Path)
+			for _, e := range entries {
+				add(e.Path, e.URL, queueSource{Title: e.Title})
+			}
+			continue
+		}
+		add(it.Path, it.URL, it.queueSource)
+	}
+	return srcs
 }
 
 func orTrue(b *bool) bool { return b == nil || *b }
@@ -205,6 +231,7 @@ func (h *helper) serveClient(c *client, r io.Reader) {
 			log.Printf("bad command %q: %v", sc.Text(), err)
 			continue
 		}
+		debugf("command from %s: %s", cmp.Or(c.owner.ID, "client"), sc.Bytes())
 		h.handle(cmd, c)
 	}
 	h.cmu.Lock()
@@ -220,7 +247,7 @@ const version = "0.1.0"
 
 // protocolVersion goes up when commands or events are added. Changes are
 // additive, so a client needs a helper with at least its own number.
-const protocolVersion = 2
+const protocolVersion = 3
 
 func (h *helper) handle(c command, from *client) {
 	switch c.Cmd {
@@ -261,35 +288,22 @@ func (h *helper) handle(c command, from *client) {
 	case "playlist":
 		go h.expandPlaylist(c.Path, from)
 	case "queue":
-		var srcs []queueSource
-		add := func(path, link string, meta queueSource) {
-			if src, err := source(path, link); err == nil {
-				meta.Source = src
-				srcs = append(srcs, meta)
-			}
-		}
-		for _, it := range c.Items {
-			if it.URL == "" && isPlaylist(it.Path) {
-				entries, _ := readPlaylist(it.Path)
-				for _, e := range entries {
-					add(e.Path, e.URL, queueSource{Title: e.Title})
-				}
-				continue
-			}
-			add(it.Path, it.URL, it.queueSource)
-		}
+		srcs := queueSources(c.Items)
 		if len(srcs) == 0 {
 			from.send(errorEvent("unsupportedLink", errors.New("empty queue")))
 			return
 		}
-		opts := queueOptions{Interval: c.Interval, Loop: c.Loop, ShrinkPhotos: c.ShrinkPhotos != nil && *c.ShrinkPhotos,
+		opts := queueOptions{Interval: c.Interval, Loop: c.Loop, Repeat: c.Repeat, Times: max(c.Times, 0), ShrinkPhotos: c.ShrinkPhotos != nil && *c.ShrinkPhotos,
 			ConvertVideos: orTrue(c.ConvertVideos), Port: c.Port}
 		h.start(c.Device, from, func(d device) activeSession { return newMediaSession(h, d, srcs, c.Index, opts) })
 	case "move":
 		go h.move(c.Device)
 	case "thumbnail":
 		go h.thumbnail(c.Path, c.Size, from)
-	case "pause", "resume", "seek", "subtitles", "next", "previous", "jump", "slideshow":
+	case "pause", "resume", "seek", "subtitles", "next", "previous", "jump", "slideshow", "edit", "repeat":
+		if c.Cmd == "edit" {
+			c.sources = queueSources(c.Items)
+		}
 		h.mu.Lock()
 		m, _ := h.sess.(*mediaSession)
 		h.mu.Unlock()

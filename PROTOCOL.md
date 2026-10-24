@@ -41,9 +41,12 @@ for, and should suggest an update otherwise. Helpers that don't report it speak 
 {"cmd": "play", "device": "<id>", "path": "/abs/movie.mkv" | "url": "https://…", "port": 47830,
  "title"?, "artist"?, "album"?, "art"?}
 {"cmd": "queue", "device": "<id>", "items": [{"path": "…"} | {"url": "…"}, …], "index": 0,
- "interval": 8, "loop": false, "shrinkPhotos": true, "convertVideos": true, "port": 47830}
+ "interval": 8, "loop": false, "shrinkPhotos": true, "convertVideos": true, "port": 47830,
+ "repeat"?: "show|item", "times"?: 1 /* 3: 0 until stopped */}
 {"cmd": "pause"} {"cmd": "resume"} {"cmd": "seek", "position": 30} {"cmd": "subtitles", "on": false}
 {"cmd": "next"} {"cmd": "previous"} {"cmd": "jump", "index": 3} {"cmd": "slideshow", "interval": 0}
+{"cmd": "edit", "items": [{"path": "…"} | {"url": "…"}, …], "index": 0}  // 3: replaces the running queue
+{"cmd": "repeat", "repeat": "show|item|", "times": 0}           // 3: for the running queue
 {"cmd": "move", "device": "<id>"}                              // the same cast on another device
 {"cmd": "thumbnail", "path": "/abs/video.mp4", "size": 256}    // a song's thumbnail is its cover
 {"cmd": "playlist", "path": "/abs/list.m3u8"}                  // .m3u, .m3u8, .pls
@@ -56,6 +59,14 @@ an http(s) link or an absolute path of a cover image. The device shows it, and t
 it instead of the file name or link. A song file's own tags fill in what isn't given. A playlist
 file in `items` expands in place.
 
+`edit` (protocol 3) replaces the queue of a running cast, for a show edited while it plays. Items
+already in the queue keep what was prepared for them. When the item at `index` is the one playing,
+it keeps playing; otherwise the device shows the item at `index`.
+
+`repeat` (protocol 3) says what plays again when it ends by itself: the whole queue (`show`) or the
+current item (`item`), `times` more times, or until stopped with `times` 0. An empty `repeat` turns
+it off. `loop: true` is the same as `show` until stopped. Next and previous always move on.
+
 ## Events
 
 ```jsonc
@@ -66,10 +77,10 @@ file in `items` expands in place.
    "protocol"?: "airplay", "credential"?: "pin|password" /* while pairing */,
    // media only:
    "title", "progress", "playerState", "position", "positionAt", "duration", "rate",
-   "subtitles", "subtitlesOn", "index", "interval", "paused", "loop",
-   "queue": [{"title", "artist", "album", "art"? /* links only */, "kind": "image|video|audio|link|youtube",
+   "subtitles", "subtitlesOn", "index", "interval", "paused", "loop", "repeat", "times" /* 3 */,
+   "queue": [{"source" /* 3: path or link */, "title", "artist", "album", "art"? /* links only */, "kind": "image|video|audio|link|youtube",
               "status": "waiting|preparing|ready|failed", "progress", "error"?, "feature"?, "missing"?}]}}
-{"event": "check", "protocol": 2, "version": "0.1.0", "distro": "arch|debian|fedora|opensuse|other",
+{"event": "check", "protocol": 3, "version": "0.1.0", "distro": "arch|debian|fedora|opensuse|other",
  "missing": [required ids], "deps": [{"id", "package", "required", "present", "features": […]}]}
 {"event": "restoreToken", "token": "…"}                      // keep it for the next mirroring start
 {"event": "thumbnail", "path": "…", "file": "~/.cache/dms/cast/thumbs/<hash>.jpg" | ""}

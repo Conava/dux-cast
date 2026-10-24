@@ -72,8 +72,11 @@ func mergeDevices(found map[string]Device) []device {
 }
 
 // debug turns on per-message and per-request logging, for troubleshooting:
-// CAST_DEBUG=1 in the shell's environment.
-var debug = os.Getenv("CAST_DEBUG") != ""
+// CAST_DEBUG=1 in the shell's environment, or a development build with
+// -ldflags "-X main.debugBuild=1".
+var debugBuild string
+
+var debug = os.Getenv("CAST_DEBUG") != "" || debugBuild != ""
 
 func debugf(format string, args ...any) {
 	if debug {

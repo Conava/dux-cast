@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,12 +39,15 @@ type mediaSession struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	cmds   chan command
-	ready  chan int // an item finished preparing
+	ready  chan *queueItem // an item finished preparing
 
 	mu        sync.Mutex
 	items     []*queueItem
+	all       []*queueItem // every item the queue has held, for the cleanup at the end
 	index     int
 	paused    bool // a slideshow's auto-advance is held
+	showLeft  int  // repeats of the show still to come, when Times is set
+	itemLeft  int  // repeats of the current item still to come, when Times is set
 	phase     string
 	st        playerStatus
 	subsOn    bool
@@ -62,7 +66,9 @@ type mediaSession struct {
 
 type queueOptions struct {
 	Interval      int     // seconds per photo; 0 = advance by hand
-	Loop          bool    // start over after the last item
+	Loop          bool    // start over after the last item; Repeat "show" with Times 0 says the same
+	Repeat        string  // what plays again when it ends: "show", "item", or "" for nothing
+	Times         int     // how often it plays again; 0 until stopped
 	ShrinkPhotos  bool    // compress photos above 4K to 4K JPEG; off sends originals
 	ConvertVideos bool    // convert to formats the device plays: video above 4K or in other codecs, HEIC
 	Port          int     // file server port
@@ -128,13 +134,18 @@ func newQueueItem(src queueSource) *queueItem {
 func newMediaSession(h *helper, d device, sources []queueSource, index int, opts queueOptions) *mediaSession {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &mediaSession{h: h, dev: d, opts: opts, ctx: ctx, cancel: cancel, done: make(chan struct{}),
-		cmds: make(chan command, 8), ready: make(chan int, 8), phase: "starting", index: index}
+		cmds: make(chan command, 8), ready: make(chan *queueItem, 8), phase: "starting", index: index}
 	for _, s := range sources {
 		m.items = append(m.items, newQueueItem(s))
 	}
+	m.all = m.items
 	if index < 0 || index >= len(m.items) {
 		m.index = 0
 	}
+	if m.opts.Repeat == "" && m.opts.Loop {
+		m.opts.Repeat = "show"
+	}
+	m.showLeft, m.itemLeft = m.opts.Times, m.opts.Times
 	return m
 }
 
@@ -154,7 +165,7 @@ func (m *mediaSession) status() map[string]any {
 	}
 	queue := make([]map[string]any, len(m.items))
 	for i, it := range m.items {
-		q := map[string]any{"title": it.title, "artist": it.artist, "album": it.album, "kind": it.kind, "status": it.status, "progress": it.progress}
+		q := map[string]any{"source": it.source, "title": it.title, "artist": it.artist, "album": it.album, "kind": it.kind, "status": it.status, "progress": it.progress}
 		if isLink(it.art) {
 			q["art"] = it.art
 		}
@@ -175,7 +186,8 @@ func (m *mediaSession) status() map[string]any {
 		"title": title, "progress": cur.progress, "playerState": m.st.PlayerState, "position": m.st.CurrentTime,
 		"positionAt": at, "duration": m.st.Duration, "rate": max(m.st.Rate, 1),
 		"subtitles": cur.media.subURL != "", "subtitlesOn": m.subsOn, "volume": m.volume, "canVolume": m.canVolume,
-		"queue": queue, "index": m.index, "interval": interval, "paused": m.paused, "loop": m.opts.Loop}
+		"queue": queue, "index": m.index, "interval": interval, "paused": m.paused,
+		"loop": m.wraps(), "repeat": m.opts.Repeat, "times": m.opts.Times}
 }
 
 // position is where the current item is now, for moving the cast.
@@ -261,7 +273,7 @@ func (m *mediaSession) run() (code string, err error) {
 	defer func() { undo.run() }()
 	defer func() {
 		m.mu.Lock()
-		for _, it := range m.items {
+		for _, it := range m.all {
 			for _, f := range it.files {
 				os.Remove(f)
 			}
@@ -354,20 +366,24 @@ func (m *mediaSession) run() (code string, err error) {
 		cast.send(transport, nsMedia, map[string]any{"type": "GET_STATUS", "requestId": 9})
 	}
 
-	pending := -1 // an item waiting to be shown once it's prepared
+	var pending *queueItem // an item waiting to be shown once it's prepared
 	var advance <-chan time.Time
 	var unreachable <-chan time.Time
 	show := func(i int) {
 		advance = nil
 		m.mu.Lock()
+		if i != m.index {
+			m.itemLeft = m.opts.Times
+		}
 		m.index = i
 		it := m.items[i]
 		status := it.status
 		m.mu.Unlock()
+		debugf("showing %d of %d: %s (%s)", i+1, len(m.items), it.source, status)
 		m.prune()
 		switch status {
 		case "ready":
-			pending = -1
+			pending = nil
 			m.load(it)
 			if m.srv != nil && it.kind != "link" && unreachable == nil && !m.srv.fetched.Load() {
 				unreachable = time.After(10 * time.Second)
@@ -376,28 +392,46 @@ func (m *mediaSession) run() (code string, err error) {
 				advance = time.After(time.Duration(m.opts.Interval) * time.Second)
 			}
 		case "failed":
-			pending = -1
+			pending = nil
 			m.h.emitError(it.code, it.err)
 			if len(m.items) > 1 {
 				advance = time.After(2 * time.Second)
 			}
 		default:
-			pending = i
+			pending = it
 			m.setPhase("converting")
 		}
 		m.prepareAhead()
 		m.h.emitState()
 	}
-	// step moves by delta, wrapping when looping; it reports false at an end.
+	// step moves by delta, wrapping while the show repeats; it reports false at an end.
 	step := func(delta int) bool {
 		m.mu.Lock()
-		i, n := m.index+delta, len(m.items)
+		i := m.stepTo(delta)
 		m.mu.Unlock()
-		if i < 0 || i >= n {
-			if !m.opts.Loop {
-				return false
+		if i < 0 {
+			return false
+		}
+		show(i)
+		return true
+	}
+	// ended moves on when an item ends by itself, which the repeat setting
+	// decides; it reports false when nothing follows.
+	ended := func() bool {
+		m.mu.Lock()
+		i := m.afterEnd()
+		photo := i == m.index && m.items[i].kind == "image"
+		m.mu.Unlock()
+		if i < 0 {
+			return false
+		}
+		// A repeated photo stays on screen for another interval.
+		if photo {
+			if m.autoAdvance() {
+				advance = time.After(time.Duration(m.opts.Interval) * time.Second)
 			}
-			i = (i + n) % n
+			m.h.emitState()
+			return true
 		}
 		show(i)
 		return true
@@ -418,16 +452,18 @@ func (m *mediaSession) run() (code string, err error) {
 			if !m.srv.fetched.Load() {
 				return stopped("serverUnreachable", fmt.Errorf("the device did not fetch anything from %s", m.srv.ln.Addr()))
 			}
-		case i := <-m.ready:
-			if i != pending {
+		case it := <-m.ready:
+			if it != pending {
 				continue
 			}
 			if len(m.items) == 1 && m.items[0].status == "failed" {
 				return stopped(m.items[0].code, m.items[0].err)
 			}
-			show(i)
+			if i := m.indexOf(it); i >= 0 {
+				show(i)
+			}
 		case <-advance:
-			if !step(1) {
+			if !ended() {
 				advance = nil
 			}
 		case c := <-m.cmds:
@@ -440,6 +476,25 @@ func (m *mediaSession) run() (code string, err error) {
 				if c.Index >= 0 && c.Index < len(m.items) {
 					show(c.Index)
 				}
+			case "edit":
+				if len(c.sources) == 0 {
+					continue
+				}
+				if m.edit(c.sources, c.Index) {
+					show(m.index)
+					continue
+				}
+				m.prune()
+				m.prepareAhead()
+				m.player.update(m)
+				m.h.emitState()
+			case "repeat":
+				m.mu.Lock()
+				m.opts.Repeat, m.opts.Times = c.Repeat, max(c.Times, 0)
+				m.showLeft, m.itemLeft = m.opts.Times, m.opts.Times
+				m.mu.Unlock()
+				m.prepareAhead()
+				m.h.emitState()
 			case "slideshow":
 				m.mu.Lock()
 				m.opts.Interval, m.paused = c.Interval, false
@@ -511,7 +566,7 @@ func (m *mediaSession) run() (code string, err error) {
 				case idle == "FINISHED" && youtube:
 					// The YouTube app idles between playlist videos.
 				case idle == "FINISHED" && cur.kind != "image":
-					if !step(1) {
+					if !ended() {
 						if len(m.items) == 1 {
 							return "", nil
 						}
@@ -592,7 +647,7 @@ func (m *mediaSession) prepareAhead() {
 			m.mu.Unlock()
 			m.h.emitState()
 
-			err := m.prepare(i, it)
+			err := m.prepare(it)
 			m.mu.Lock()
 			if err != nil {
 				it.status, it.err = "failed", err
@@ -612,7 +667,7 @@ func (m *mediaSession) prepareAhead() {
 			}
 			m.h.emitState()
 			select {
-			case m.ready <- i:
+			case m.ready <- it:
 			case <-m.ctx.Done():
 				return
 			}
@@ -622,13 +677,13 @@ func (m *mediaSession) prepareAhead() {
 
 // artURL is where the device fetches an item's cover from the client: a link
 // as it is, a local file over the file server.
-func (m *mediaSession) artURL(i int, it *queueItem) string {
+func (m *mediaSession) artURL(it *queueItem) string {
 	switch {
 	case isLink(it.art):
 		return it.art
 	case filepath.IsAbs(it.art) && m.srv != nil:
 		if _, err := os.Stat(it.art); err == nil {
-			return m.srv.add(fmt.Sprintf("%d-art%s", i, path.Ext(it.art)), it.art, typeByExt(it.art))
+			return m.srv.add(fmt.Sprintf("%p-art%s", it, path.Ext(it.art)), it.art, typeByExt(it.art))
 		}
 	}
 	return ""
@@ -643,6 +698,42 @@ func (m *mediaSession) hasLinks() bool {
 	return false
 }
 
+// wraps says whether the show starts over after its last item. Called with mu held.
+func (m *mediaSession) wraps() bool {
+	return m.opts.Repeat == "show" && (m.opts.Times == 0 || m.showLeft > 0)
+}
+
+// stepTo is the item delta away from the current one, wrapping around while
+// the show repeats, or -1 at an end. Going past the last item uses up a
+// repeat. Called with mu held.
+func (m *mediaSession) stepTo(delta int) int {
+	i, n := m.index+delta, len(m.items)
+	if i >= 0 && i < n {
+		return i
+	}
+	if !m.wraps() {
+		return -1
+	}
+	if delta > 0 && m.opts.Times > 0 {
+		m.showLeft--
+	}
+	return (i%n + n) % n
+}
+
+// afterEnd is what plays when the current item ends by itself: the same one
+// again while it repeats, otherwise the next one, or -1. A failed item isn't
+// repeated. Called with mu held.
+func (m *mediaSession) afterEnd() int {
+	it := m.items[m.index]
+	if m.opts.Repeat == "item" && it.status != "failed" && (m.opts.Times == 0 || m.itemLeft > 0) {
+		if m.opts.Times > 0 {
+			m.itemLeft--
+		}
+		return m.index
+	}
+	return m.stepTo(1)
+}
+
 // nextToPrepare picks the first waiting item in the look-ahead window.
 // Called with mu held.
 func (m *mediaSession) nextToPrepare() int {
@@ -650,7 +741,7 @@ func (m *mediaSession) nextToPrepare() int {
 	for ahead := 0; ahead <= 2 && ahead < n; ahead++ {
 		i := m.index + ahead
 		if i >= n {
-			if !m.opts.Loop {
+			if !m.wraps() {
 				break
 			}
 			i %= n
@@ -675,7 +766,7 @@ func (m *mediaSession) prune() {
 	for i, it := range m.items {
 		// When looping, the items at the start are also the ones coming up.
 		far := m.index-i > 2
-		if m.opts.Loop {
+		if m.wraps() {
 			behind := (m.index - i + n) % n
 			far = behind > 2 && behind < n-2
 		}
@@ -686,6 +777,60 @@ func (m *mediaSession) prune() {
 			it.files, it.status = nil, "waiting"
 		}
 	}
+}
+
+// edit replaces the queue with srcs, shown from index. Items still in it keep
+// what was prepared for them, and the current one keeps playing when it is
+// at index. It reports whether the device has to show another item.
+func (m *mediaSession) edit(srcs []queueSource, index int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur := m.items[m.index]
+	index = max(0, min(index, len(srcs)-1))
+	unused := slices.Clone(m.items)
+	take := func(src string, want *queueItem) *queueItem {
+		for i, it := range unused {
+			if it != nil && it.source == src && (want == nil || it == want) {
+				unused[i] = nil
+				return it
+			}
+		}
+		return nil
+	}
+	items := make([]*queueItem, len(srcs))
+	if srcs[index].Source == cur.source {
+		items[index] = take(cur.source, cur)
+	}
+	for i, src := range srcs {
+		if items[i] != nil {
+			continue
+		}
+		if items[i] = take(src.Source, nil); items[i] == nil {
+			items[i] = newQueueItem(src)
+			m.all = append(m.all, items[i])
+		}
+	}
+	// A dropped item still preparing is cleaned up when the session ends.
+	for _, it := range unused {
+		if it == nil || it.status == "preparing" {
+			continue
+		}
+		for _, f := range it.files {
+			os.Remove(f)
+		}
+		if len(it.files) > 0 {
+			it.files, it.status = nil, "waiting"
+		}
+	}
+	m.items, m.index = items, index
+	return items[index] != cur
+}
+
+// indexOf is where an item is in the queue now, or -1 once it was dropped.
+func (m *mediaSession) indexOf(it *queueItem) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Index(m.items, it)
 }
 
 func (m *mediaSession) setItemProgress(it *queueItem) func(float64) {
@@ -699,10 +844,10 @@ func (m *mediaSession) setItemProgress(it *queueItem) func(float64) {
 
 // prepare makes one item ready to load: its URL on the file server, after
 // any conversion the device needs.
-func (m *mediaSession) prepare(i int, it *queueItem) error {
+func (m *mediaSession) prepare(it *queueItem) error {
 	if it.kind == "link" {
 		it.media = mediaInfo{url: it.source, contentType: remoteType(m.ctx, it.source), title: it.title,
-			artist: it.artist, album: it.album, coverURL: m.artURL(i, it)}
+			artist: it.artist, album: it.album, coverURL: m.artURL(it)}
 		return nil
 	}
 	if _, err := os.Stat(it.source); err != nil {
@@ -718,7 +863,7 @@ func (m *mediaSession) prepare(i int, it *queueItem) error {
 	if err != nil {
 		return err
 	}
-	it.media = mediaInfo{url: m.srv.add(fmt.Sprintf("%d%s", i, path.Ext(file)), file, ct), contentType: ct, title: it.title}
+	it.media = mediaInfo{url: m.srv.add(fmt.Sprintf("%p%s", it, path.Ext(file)), file, ct), contentType: ct, title: it.title}
 	if it.kind == "audio" {
 		song := probeSong(it.source)
 		if song.title != "" && !it.named {
@@ -729,17 +874,17 @@ func (m *mediaSession) prepare(i int, it *queueItem) error {
 		it.media.title, it.media.artist, it.media.album = it.title, it.artist, it.album
 		switch cover := folderCover(it.source); {
 		case it.art != "":
-			it.media.coverURL = m.artURL(i, it)
+			it.media.coverURL = m.artURL(it)
 		case song.cover != nil:
-			it.media.coverURL = m.srv.addBytes(fmt.Sprintf("%d-cover", i), song.cover, song.coverType)
+			it.media.coverURL = m.srv.addBytes(fmt.Sprintf("%p-cover", it), song.cover, song.coverType)
 		case cover != "":
-			it.media.coverURL = m.srv.add(fmt.Sprintf("%d-cover%s", i, path.Ext(cover)), cover, typeByExt(cover))
+			it.media.coverURL = m.srv.add(fmt.Sprintf("%p-cover%s", it, path.Ext(cover)), cover, typeByExt(cover))
 		}
 	}
 	if it.kind == "video" {
 		if sub := sidecarSubtitle(it.source); sub != "" {
 			if vtt, err := loadSubtitle(sub); err == nil {
-				it.media.subURL, it.media.subLang = m.srv.addBytes(fmt.Sprintf("%d.vtt", i), vtt, "text/vtt"), "und"
+				it.media.subURL, it.media.subLang = m.srv.addBytes(fmt.Sprintf("%p.vtt", it), vtt, "text/vtt"), "und"
 			}
 		}
 	}
