@@ -30,6 +30,9 @@ for, and should suggest an update otherwise. Helpers that don't report it speak 
 | 3 | `edit`, `repeat` and `times` for a running queue |
 | 4 | `noCast` in `state`, `debug` |
 
+`cast-helper install-missing [all|required]` installs what's missing through the distro's package
+manager. It's meant for a terminal, so it can ask for the password and confirmation.
+
 ## Commands
 
 ```jsonc
@@ -84,7 +87,7 @@ it off. `loop: true` is the same as `show` until stopped. Next and previous alwa
    "subtitles", "subtitlesOn", "index", "interval", "paused", "loop", "repeat", "times" /* 3 */,
    "queue": [{"source" /* 3: path or link */, "title", "artist", "album", "art"? /* links only */, "kind": "image|video|audio|link|youtube",
               "status": "waiting|preparing|ready|failed", "progress", "error"?, "feature"?, "missing"?}]}}
-{"event": "check", "protocol": 3, "version": "0.1.0", "distro": "arch|debian|fedora|opensuse|other",
+{"event": "check", "protocol": 4, "version": "0.2.0", "distro": "arch|debian|fedora|opensuse|other",
  "missing": [required ids], "deps": [{"id", "package", "required", "present", "features": […]}]}
 {"event": "restoreToken", "token": "…"}                      // keep it for the next mirroring start
 {"event": "thumbnail", "path": "…", "file": "~/.cache/dms/cast/thumbs/<hash>.jpg" | ""}

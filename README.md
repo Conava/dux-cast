@@ -35,7 +35,7 @@ openSUSE:
 
 ```bash
 sudo zypper install avahi gstreamer-plugins-base gstreamer-plugins-bad gstreamer-plugin-pipewire \
-  gstreamer-plugins-good gstreamer-plugins-libav pipewire-tools heif-examples
+  gstreamer-plugins-good gstreamer-plugins-libav pipewire-tools
 ```
 
 Arch, when building from source:
@@ -115,6 +115,7 @@ cast-helper attach   # what an app runs: stdin and stdout go to the shared helpe
 cast-helper serve    # the shared helper; attach starts it when needed
 cast-helper          # a private helper on stdin and stdout, for one app
 cast-helper version
+cast-helper install-missing [all|required]   # installs what's missing, in a terminal
 ```
 
 Commands and events are JSON lines, described in [PROTOCOL.md](PROTOCOL.md).

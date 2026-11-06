@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -28,6 +29,20 @@ type dependency struct {
 	// third-party repository; the plugin turns the code into text.
 	Hints  map[string]string
 	Manual bool // installed by hand, never part of the install command
+	// Distro families whose repositories don't carry it; it's manual there.
+	NoPackage []string
+}
+
+func (d dependency) manualOn(distro string) bool {
+	return d.Manual || slices.Contains(d.NoPackage, distro)
+}
+
+// fakeMissing lists dependency ids to report as missing, to test how a client
+// handles them: a development build with -ldflags "-X main.fakeMissing=a,b".
+var fakeMissing string
+
+func (d dependency) installed() bool {
+	return !slices.Contains(strings.Split(fakeMissing, ","), d.ID) && d.present()
 }
 
 func elements(names ...string) func() bool {
@@ -96,8 +111,79 @@ var dependencies = []dependency{
 			"opensuse": "doubletakeRelease", "other": "doubletakeRelease"}},
 	// Ubuntu 24.04 ships only the older heif-convert.
 	{ID: "libheif", Features: []string{"heic"}, present: func() bool { return heifTool() != "" },
-		Packages: map[string]string{"debian": "libheif-examples", "fedora": "libheif-tools", "opensuse": "heif-examples"},
-		Hints:    map[string]string{"fedora": "rpmfusionHeif"}},
+		Packages:  map[string]string{"debian": "libheif-examples", "fedora": "libheif-tools", "opensuse": "heif-dec"},
+		Hints:     map[string]string{"fedora": "rpmfusionHeif", "opensuse": "noPackage"},
+		NoPackage: []string{"opensuse"}},
+}
+
+// installSteps are the commands that install these dependencies on a distro,
+// and the ones it can't install, which need a manual step. aur is the AUR helper,
+// if there is one. Packages shared by several dependencies are listed once.
+func installSteps(distro, aur string, deps []dependency) (steps [][]string, manual []string) {
+	install := map[string][]string{
+		"arch":     {"sudo", "pacman", "-S", "--needed"},
+		"debian":   {"sudo", "apt", "install"},
+		"fedora":   {"sudo", "dnf", "install"},
+		"opensuse": {"sudo", "zypper", "install"},
+	}[distro]
+	var packages, fromAUR []string
+	avahi := false
+	for _, d := range deps {
+		pkg := d.ID
+		if p, ok := d.Packages[distro]; ok {
+			pkg = p
+		}
+		switch {
+		case d.Manual && distro == "arch" && aur != "":
+			fromAUR = append(fromAUR, pkg)
+		case d.manualOn(distro) || install == nil:
+			manual = append(manual, pkg)
+		case !slices.Contains(packages, pkg):
+			packages = append(packages, pkg)
+		}
+		avahi = avahi || d.ID == "avahi"
+	}
+	if len(packages) > 0 {
+		steps = append(steps, append(slices.Clone(install), packages...))
+	}
+	if len(fromAUR) > 0 {
+		steps = append(steps, append([]string{aur, "-S", "--needed"}, fromAUR...))
+	}
+	// avahi counts as missing until its daemon runs.
+	if avahi && install != nil {
+		steps = append(steps, []string{"sudo", "systemctl", "enable", "--now", "avahi-daemon"})
+	}
+	return steps, manual
+}
+
+// installMissing installs what's missing, for the plugin's one-click setup. It
+// runs in a terminal, so the package manager can ask for the password and confirmation.
+func installMissing(all bool) error {
+	var missing []dependency
+	for _, d := range dependencies {
+		if !d.installed() && (all || d.Required) {
+			missing = append(missing, d)
+		}
+	}
+	aur := ""
+	for _, tool := range []string{"paru", "yay"} {
+		if _, err := exec.LookPath(tool); err == nil {
+			aur = tool
+			break
+		}
+	}
+	steps, manual := installSteps(distroFamily(), aur, missing)
+	for _, step := range steps {
+		cmd := exec.Command(step[0], step[1:]...)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("%s: %w", strings.Join(step, " "), err)
+		}
+	}
+	if len(manual) > 0 {
+		fmt.Println("Install these yourself:", strings.Join(manual, " "))
+	}
+	return nil
 }
 
 // heifTool is the HEIC decoder on PATH, if any.
@@ -118,7 +204,7 @@ func missingFor(features ...string) []string {
 		for _, f := range features {
 			needed = needed || slices.Contains(d.Features, f)
 		}
-		if needed && !d.present() {
+		if needed && !d.installed() {
 			missing = append(missing, d.ID)
 		}
 	}
@@ -136,13 +222,13 @@ func dependencyReport() map[string]any {
 		if p, ok := d.Packages[distro]; ok {
 			pkg = p
 		}
-		present := d.present()
+		present := d.installed()
 		if !present && d.Required {
 			missing = append(missing, d.ID)
 		}
 		dep := map[string]any{"id": d.ID, "package": pkg, "required": d.Required,
 			"features": d.Features, "present": present}
-		if d.Manual {
+		if d.manualOn(distro) {
 			dep["manual"] = true
 		}
 		if hint, ok := d.Hints[distro]; ok {

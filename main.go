@@ -5,6 +5,7 @@
 //	cast-helper          talks over stdin and stdout, exits when stdin closes
 //	cast-helper serve    the shared helper, on a socket in $XDG_RUNTIME_DIR
 //	cast-helper attach   connects stdin and stdout to it, starting it if needed
+//	cast-helper install-missing [all|required]   installs what's missing, in a terminal
 package main
 
 import (
@@ -189,8 +190,12 @@ func main() {
 		err = runAttach()
 	case "version", "--version":
 		fmt.Println(version)
+	case "install-missing", "install-missing all":
+		err = installMissing(true)
+	case "install-missing required":
+		err = installMissing(false)
 	default:
-		err = fmt.Errorf("unknown command %q; use serve, attach or no argument", mode)
+		err = fmt.Errorf("unknown command %q; use serve, attach, install-missing [all|required] or no argument", mode)
 	}
 	if err != nil {
 		log.Print(err)
