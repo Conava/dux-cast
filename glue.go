@@ -5,12 +5,13 @@ import (
 	"log"
 	"os"
 	"slices"
+	"sync/atomic"
 
 	"github.com/godbus/dbus/v5"
 )
 
 // discover reports the full device list on every change until ctx ends.
-func discover(ctx context.Context, onChange func([]device)) error {
+func discover(ctx context.Context, onChange func(devs []device, noCast []string)) error {
 	conn, err := dbus.ConnectSystemBus()
 	if err != nil {
 		return err
@@ -34,7 +35,7 @@ func discover(ctx context.Context, onChange func([]device)) error {
 			} else {
 				delete(found, e.Device.ID)
 			}
-			onChange(mergeDevices(found))
+			onChange(mergeDevices(found), tvsWithoutCast(found))
 		}
 	}
 }
@@ -45,6 +46,9 @@ func mergeDevices(found map[string]Device) []device {
 	byAddr := map[string]*device{}
 	var order []string
 	for _, f := range found {
+		if f.Protocol == "androidtv" {
+			continue
+		}
 		d := byAddr[f.Addr]
 		if d == nil {
 			d = &device{Host: f.Addr}
@@ -71,15 +75,36 @@ func mergeDevices(found map[string]Device) []device {
 	return list
 }
 
+// tvsWithoutCast names the Android TVs on the network that advertise neither
+// Cast nor AirPlay, so they can't show up as devices.
+func tvsWithoutCast(found map[string]Device) []string {
+	casts := map[string]bool{}
+	for _, f := range found {
+		if f.Protocol != "androidtv" {
+			casts[f.Addr] = true
+		}
+	}
+	names := []string{}
+	for _, f := range found {
+		if f.Protocol == "androidtv" && !casts[f.Addr] {
+			names = append(names, f.Name)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
 // debug turns on per-message and per-request logging, for troubleshooting:
-// CAST_DEBUG=1 in the shell's environment, or a development build with
-// -ldflags "-X main.debugBuild=1".
+// the debug command, CAST_DEBUG=1 in the shell's environment, or a development
+// build with -ldflags "-X main.debugBuild=1".
 var debugBuild string
 
-var debug = os.Getenv("CAST_DEBUG") != "" || debugBuild != ""
+var debug atomic.Bool
+
+func init() { debug.Store(os.Getenv("CAST_DEBUG") != "" || debugBuild != "") }
 
 func debugf(format string, args ...any) {
-	if debug {
+	if debug.Load() {
 		log.Printf(format, args...)
 	}
 }

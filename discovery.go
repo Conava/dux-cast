@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/godbus/dbus/v5"
@@ -20,6 +21,8 @@ const (
 var serviceTypes = map[string]string{
 	"_googlecast._tcp": "chromecast",
 	"_airplay._tcp":    "airplay",
+	// Only to tell a TV with Cast turned off from one that isn't on this network.
+	"_androidtvremote2._tcp": "androidtv",
 }
 
 // ErrAvahiUnavailable maps to "avahi" in the helper's check result.
@@ -217,6 +220,7 @@ func (d *Discovery) loop() {
 			d.handle(s)
 		case r := <-d.resolves:
 			if r.err != nil {
+				log.Printf("discovery: can't resolve %s: %v", r.in.name, r.err)
 				d.reg.removed(r.in) // device advertises but doesn't answer; drop it until it re-announces
 				continue
 			}

@@ -213,6 +213,8 @@ func startServer() error {
 	if err != nil {
 		return err
 	}
+	// A cast that failed is reported after the next start, so its log has to survive that.
+	os.Rename(filepath.Join(dir, "serve.log"), filepath.Join(dir, "serve.old.log"))
 	logFile, err := os.Create(filepath.Join(dir, "serve.log"))
 	if err != nil {
 		return err

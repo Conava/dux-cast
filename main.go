@@ -155,6 +155,7 @@ type helper struct {
 
 	mu           sync.Mutex
 	devices      map[string]device
+	noCast       []string
 	stopDiscover context.CancelFunc
 	discoverers  int // the plugin's request plus a start waiting for its device
 	sess         activeSession
@@ -231,7 +232,12 @@ func (h *helper) serveClient(c *client, r io.Reader) {
 			log.Printf("bad command %q: %v", sc.Text(), err)
 			continue
 		}
-		debugf("command from %s: %s", cmp.Or(c.owner.ID, "client"), sc.Bytes())
+		// Bug reports include this log: pair carries a PIN, start the portal's restore token.
+		if cmd.Cmd == "pair" || cmd.Cmd == "start" {
+			debugf("command from %s: %s", cmp.Or(c.owner.ID, "client"), cmd.Cmd)
+		} else {
+			debugf("command from %s: %s", cmp.Or(c.owner.ID, "client"), sc.Bytes())
+		}
 		h.handle(cmd, c)
 	}
 	h.cmu.Lock()
@@ -243,11 +249,11 @@ func (h *helper) serveClient(c *client, r io.Reader) {
 }
 
 // version is this release; the release workflow checks the tag against it.
-const version = "0.1.0"
+const version = "0.2.0"
 
 // protocolVersion goes up when commands or events are added. Changes are
 // additive, so a client needs a helper with at least its own number.
-const protocolVersion = 3
+const protocolVersion = 4
 
 func (h *helper) handle(c command, from *client) {
 	switch c.Cmd {
@@ -324,6 +330,9 @@ func (h *helper) handle(c command, from *client) {
 		if s != nil {
 			s.SetVolume(c.Level)
 		}
+	case "debug":
+		debug.Store(c.On)
+		log.Printf("detailed logging: %v", c.On)
 	default:
 		log.Printf("unknown command %q", c.Cmd)
 	}
@@ -384,6 +393,7 @@ func (h *helper) stateEvent() map[string]any {
 	for _, d := range h.devices {
 		devs = append(devs, d)
 	}
+	noCast := h.noCast
 	var sess any
 	if h.sess != nil {
 		st := h.sess.status()
@@ -394,7 +404,7 @@ func (h *helper) stateEvent() map[string]any {
 	}
 	h.mu.Unlock()
 	slices.SortFunc(devs, func(a, b device) int { return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name)) })
-	return map[string]any{"event": "state", "devices": devs, "session": sess}
+	return map[string]any{"event": "state", "devices": devs, "noCast": noCast, "session": sess}
 }
 
 // setDiscovery browses while any client shows a device list.
@@ -424,8 +434,9 @@ func (h *helper) updateDiscoveryLocked() {
 		ctx, cancel := context.WithCancel(context.Background())
 		h.stopDiscover = cancel
 		go func() {
-			err := discover(ctx, func(devs []device) {
+			err := discover(ctx, func(devs []device, noCast []string) {
 				h.mu.Lock()
+				h.noCast = noCast
 				h.devices = map[string]device{}
 				for _, d := range devs {
 					h.devices[d.ID] = d
@@ -445,6 +456,7 @@ func (h *helper) updateDiscoveryLocked() {
 	if h.discoverers == 0 && h.stopDiscover != nil {
 		h.stopDiscover()
 		h.stopDiscover = nil
+		h.noCast = nil
 		// Keep the device being cast to; forget the rest.
 		for id := range h.devices {
 			if h.sess == nil || h.sess.deviceID() != id {

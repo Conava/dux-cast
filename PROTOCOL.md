@@ -27,6 +27,8 @@ for, and should suggest an update otherwise. Helpers that don't report it speak 
 |---|---|
 | 1 | Everything below not marked otherwise |
 | 2 | `serve` and `attach`, `hello`, `session.owner`, `title`/`artist`/`album`/`art` on items, `version` in `check` |
+| 3 | `edit`, `repeat` and `times` for a running queue |
+| 4 | `noCast` in `state`, `debug` |
 
 ## Commands
 
@@ -51,6 +53,7 @@ for, and should suggest an update otherwise. Helpers that don't report it speak 
 {"cmd": "thumbnail", "path": "/abs/video.mp4", "size": 256}    // a song's thumbnail is its cover
 {"cmd": "playlist", "path": "/abs/list.m3u8"}                  // .m3u, .m3u8, .pls
 {"cmd": "stop"}
+{"cmd": "debug", "on": true}                                   // 4: detailed logging in serve.log
 {"cmd": "volume", "level": 0.4}                                // receiver volume, where supported
 ```
 
@@ -71,6 +74,7 @@ it off. `loop: true` is the same as `show` until stopped. Next and previous alwa
 
 ```jsonc
 {"event": "state", "devices": [{"id", "name", "model", "protocol": "chromecast|airplay", "protocols": […]}],
+ "noCast": ["Smart TV"],  // 4: Android TVs on the network with Cast turned off or missing
  "session": null | {"kind": "mirror|media", "device", "name",
    "phase": "starting|authorizing|pairing|converting|casting", "since", "volume", "canVolume",
    "owner"?: {"id": "dplayer", "name": "Dux Player"},   // 2: the client that started it, after its hello

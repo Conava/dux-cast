@@ -27,6 +27,20 @@ func TestMergeDevices(t *testing.T) {
 	}
 }
 
+func TestTVsWithoutCast(t *testing.T) {
+	found := map[string]Device{
+		"chromecast:abc":     {Protocol: "chromecast", Addr: "192.168.2.63"},
+		"androidtv:Living":   {Name: "Living Room", Protocol: "androidtv", Addr: "192.168.2.63"},
+		"androidtv:Smart TV": {Name: "Smart TV Pro", Protocol: "androidtv", Addr: "192.168.2.70"},
+	}
+	if got := tvsWithoutCast(found); len(got) != 1 || got[0] != "Smart TV Pro" {
+		t.Errorf("tvsWithoutCast: %v", got)
+	}
+	if got := mergeDevices(found); len(got) != 1 || got[0].has("androidtv") {
+		t.Errorf("a TV without Cast must not be a device: %+v", got)
+	}
+}
+
 // Set AIRPLAY_TEST_PORT to a running doubletake-test-receiver
 // (-auth pin -code 4321) to check the session end to end.
 func TestAirplayReceiver(t *testing.T) {
